@@ -67,7 +67,7 @@ Parameters:
 
 ### Health Check
 ```
-GET /health
+GET /
 ```
 
 ## Configuration
@@ -83,36 +83,4 @@ The service can be configured using environment variables:
 | SERVER_TIMEOUT | Server timeout | 30s |
 | PORT | Server port | 8080 |
 
-## Docker Configuration
 
-The service includes Docker and Docker Compose configurations for easy deployment:
-
-- Multi-stage Dockerfile for minimal image size
-- Resource limits (CPU and memory)
-- Health checks
-- Automatic restart policy
-
-## Development
-
-### Building
-
-```bash
-# Build with Docker
-docker-compose build
-
-# Build locally
-CGO_ENABLED=1 go build -o image-converter
-```
-
-### Testing
-
-```bash
-go test ./...
-```
-
-## Performance Considerations
-
-- The service uses CGO for image processing
-- Rate limiting prevents server overload
-- Resource limits ensure stable operation
-- Automatic image resizing optimizes storage
