@@ -101,6 +101,7 @@ func releaseWorker() {
 }
 
 func uploadToS3(ctx context.Context, data []byte, key string) (string, error) {
+	startUpload := time.Now()
 	upParams := &s3.PutObjectInput{
 		Bucket:      aws.String(os.Getenv("AWS_BUCKET")),
 		Key:         aws.String(key),
@@ -112,6 +113,8 @@ func uploadToS3(ctx context.Context, data []byte, key string) (string, error) {
 		return "", err
 	}
 	url := "https://" + os.Getenv("AWS_BUCKET") + ".s3." + os.Getenv("AWS_REGION") + ".amazonaws.com/" + key
+	elapsed := time.Since(startUpload)
+	log.Printf("Upload took %s", elapsed)
 	return url, nil
 }
 
