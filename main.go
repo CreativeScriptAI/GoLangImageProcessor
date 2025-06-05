@@ -53,7 +53,8 @@ var (
 	// Simple buffer pool for performance
 	bufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, ChunkSize)
+			b := make([]byte, ChunkSize)
+			return &b
 		},
 	}
 )
@@ -406,10 +407,10 @@ func processLargeImageFast(req *CompressionRequest) CompressionResponse {
 	defer tmpFile.Close()
 
 	// Use buffer pool
-	buffer := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buffer)
+	bufferPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufferPtr)
 
-	written, err := io.CopyBuffer(tmpFile, req.File, buffer)
+	written, err := io.CopyBuffer(tmpFile, req.File, *bufferPtr)
 	if err != nil {
 		return CompressionResponse{Err: fmt.Errorf("failed to copy to temp file: %v", err)}
 	}
@@ -495,11 +496,11 @@ func processLargeImageFast(req *CompressionRequest) CompressionResponse {
 
 func processStandardImageFast(req *CompressionRequest) CompressionResponse {
 	// Use buffer pool
-	buffer := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buffer)
+	bufferPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufferPtr)
 
 	var buf bytes.Buffer
-	_, err := io.CopyBuffer(&buf, req.File, buffer)
+	_, err := io.CopyBuffer(&buf, req.File, *bufferPtr)
 	if err != nil {
 		return CompressionResponse{Err: fmt.Errorf("read error: %v", err)}
 	}
