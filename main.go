@@ -380,7 +380,7 @@ func parseCompressionRequest(r *http.Request) (*CompressionRequest, error) {
 	lossless := r.FormValue("lossless") == "true"
 
 	// Parse image file
-	file, header, err := r.FormFile("image")
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		return nil, err
 	}
