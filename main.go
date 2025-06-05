@@ -32,26 +32,32 @@ import (
 	"github.com/ulule/limiter/v3/drivers/store/memory"
 )
 
-// Optimized configurable settings
+// Optimized settings for speed
 const (
-	MaxUploadSize      = 50 << 20 // 50MB total upload
-	DefaultQuality     = 80
-	MaxWidth           = 2500             // Maximum width before resizing
-	RateLimit          = "100-M"          // 100 requests per minute
-	ServerTimeout      = 60 * time.Second // Increased for large files
+	MaxUploadSize      = 30 << 20 // 30MB (reduced)
+	DefaultQuality     = 70       // Lower quality for speed
+	MaxWidth           = 1920     // Reduced max width
+	RateLimit          = "150-M"  // Higher rate limit
+	ServerTimeout      = 45 * time.Second
 	Port               = ":8080"
-	MaxConcurrentJobs  = 4        // Limit concurrent image processing
-	MaxFileSize        = 30 << 20 // 30MB per file
-	LargeFileThreshold = 15 << 20 // 15MB - threshold for special handling
-	ChunkSize          = 1 << 20  // 1MB chunks for large file processing
+	MaxConcurrentJobs  = 8          // Increased concurrency
+	MaxFileSize        = 15 << 20   // 15MB per file (reduced)
+	LargeFileThreshold = 8 << 20    // 8MB threshold
+	ChunkSize          = 512 * 1024 // 512KB chunks
 )
 
 var (
 	s3Uploader *manager.Uploader
-	workerPool chan struct{} // Semaphore for limiting concurrent processing
+	workerPool chan struct{}
+
+	// Simple buffer pool for performance
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, ChunkSize)
+		},
+	}
 )
 
-// CompressionRequest represents an image conversion request
 type CompressionRequest struct {
 	File     multipart.File
 	Header   *multipart.FileHeader
@@ -60,7 +66,6 @@ type CompressionRequest struct {
 	MaxWidth int
 }
 
-// CompressionResponse contains the result of conversion
 type CompressionResponse struct {
 	WebPData []byte
 	Err      error
@@ -71,23 +76,27 @@ func initAWS() {
 	if err != nil {
 		log.Fatalf("unable to load AWS SDK config, %v", err)
 	}
-	s3Uploader = manager.NewUploader(s3.NewFromConfig(cfg))
+
+	// Optimized uploader settings
+	s3Uploader = manager.NewUploader(s3.NewFromConfig(cfg), func(u *manager.Uploader) {
+		u.PartSize = 5 * 1024 * 1024 // 5MB parts for faster upload
+		u.Concurrency = 3            // Parallel uploads
+	})
 }
 
 func initWorkerPool() {
-	// Create a buffered channel to limit concurrent workers
 	workerPool = make(chan struct{}, MaxConcurrentJobs)
 	for i := 0; i < MaxConcurrentJobs; i++ {
-		workerPool <- struct{}{} // Fill the pool
+		workerPool <- struct{}{}
 	}
 }
 
 func acquireWorker() {
-	<-workerPool // Take a worker from the pool
+	<-workerPool
 }
 
 func releaseWorker() {
-	workerPool <- struct{}{} // Return worker to the pool
+	workerPool <- struct{}{}
 }
 
 func uploadToS3(ctx context.Context, data []byte, key string) (string, error) {
@@ -106,9 +115,9 @@ func uploadToS3(ctx context.Context, data []byte, key string) (string, error) {
 }
 
 func main() {
-	// Set memory optimization
-	debug.SetGCPercent(50)        // More aggressive garbage collection
-	debug.SetMemoryLimit(1 << 30) // 1GB memory limit
+	// Simple optimizations
+	debug.SetGCPercent(75)
+	debug.SetMemoryLimit(1 << 30)
 
 	err := godotenv.Load()
 	if err != nil {
@@ -118,7 +127,6 @@ func main() {
 	initAWS()
 	initWorkerPool()
 
-	// Set up rate limiting
 	rate, err := limiter.NewRateFromFormatted(RateLimit)
 	if err != nil {
 		log.Fatal(err)
@@ -127,10 +135,8 @@ func main() {
 	rateLimiter := limiter.New(store, rate)
 	rateLimitMiddleware := stdlib.NewMiddleware(rateLimiter)
 
-	// Start memory monitoring
 	go monitorMemory()
 
-	// Create HTTP server with timeouts
 	server := &http.Server{
 		Addr:         Port,
 		ReadTimeout:  ServerTimeout,
@@ -209,7 +215,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	// Parse request with file size validation
 	req, err := parseCompressionRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -217,19 +222,15 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer req.File.Close()
 
-	// Acquire worker
 	acquireWorker()
 	defer releaseWorker()
 
-	// Process image
 	response := processImageOptimized(req)
-
 	if response.Err != nil {
 		http.Error(w, response.Err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Upload to S3
 	key := "uploads/" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".webp"
 	s3url, err := uploadToS3(r.Context(), response.WebPData, key)
 	if err != nil {
@@ -237,7 +238,7 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Immediately free memory
+	// Quick cleanup
 	response.WebPData = nil
 	runtime.GC()
 
@@ -256,29 +257,24 @@ func batchConvertHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	// Parse multipart form with size limit
 	if err := r.ParseMultipartForm(MaxUploadSize); err != nil {
 		http.Error(w, "Unable to parse form", http.StatusBadRequest)
 		return
 	}
 
-	// Get quality/lossless settings
 	quality, err := strconv.ParseFloat(r.FormValue("quality"), 64)
 	if err != nil || quality <= 0 {
 		quality = DefaultQuality
 	}
 	lossless := r.FormValue("lossless") == "true"
 
-	// Process files with limited concurrency
 	files := r.MultipartForm.File["images"]
 
-	// Validate total files and sizes
-	if len(files) > 20 { // Limit batch size
+	if len(files) > 20 {
 		http.Error(w, "Too many files. Maximum 20 files per batch", http.StatusBadRequest)
 		return
 	}
 
-	// Check total size and individual file sizes
 	var totalSize int64
 	for _, fh := range files {
 		if fh.Size > MaxFileSize {
@@ -305,7 +301,6 @@ func batchConvertHandler(w http.ResponseWriter, r *http.Request) {
 		go func(idx int, fh *multipart.FileHeader) {
 			defer wg.Done()
 
-			// Acquire worker (limits concurrency)
 			acquireWorker()
 			defer releaseWorker()
 
@@ -338,18 +333,13 @@ func batchConvertHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			results[idx] = map[string]string{"url": s3url, "key": key}
-
-			// Free memory immediately after upload
 			resp.WebPData = nil
 		}(i, fileHeader)
 	}
 
 	wg.Wait()
-
-	// Force garbage collection after batch processing
 	runtime.GC()
 
-	// Filter out any nil/empty results (failed conversions)
 	finalResults := make([]map[string]string, 0, len(results))
 	for _, res := range results {
 		if res != nil && res["url"] != "" {
@@ -370,22 +360,18 @@ func marshalResults(results []map[string]string) string {
 }
 
 func parseCompressionRequest(r *http.Request) (*CompressionRequest, error) {
-	// Parse quality
 	quality, err := strconv.ParseFloat(r.FormValue("quality"), 64)
 	if err != nil || quality <= 0 {
 		quality = DefaultQuality
 	}
 
-	// Parse lossless flag
 	lossless := r.FormValue("lossless") == "true"
 
-	// Parse image file
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		return nil, err
 	}
 
-	// Validate file size
 	if header.Size > MaxFileSize {
 		return nil, fmt.Errorf("file too large: %d bytes (max: %d)", header.Size, MaxFileSize)
 	}
@@ -402,18 +388,16 @@ func parseCompressionRequest(r *http.Request) (*CompressionRequest, error) {
 func processImageOptimized(req *CompressionRequest) CompressionResponse {
 	fileSize := req.Header.Size
 
-	// For large files, use special handling
 	if fileSize > LargeFileThreshold {
-		return processLargeImage(req)
+		return processLargeImageFast(req)
 	}
 
-	return processStandardImage(req)
+	return processStandardImageFast(req)
 }
 
-func processLargeImage(req *CompressionRequest) CompressionResponse {
+func processLargeImageFast(req *CompressionRequest) CompressionResponse {
 	log.Printf("Processing large file: %s (%d bytes)", req.Header.Filename, req.Header.Size)
 
-	// Create a temporary file to avoid memory spikes
 	tmpFile, err := os.CreateTemp("", "large-image-*.tmp")
 	if err != nil {
 		return CompressionResponse{Err: fmt.Errorf("failed to create temp file: %v", err)}
@@ -421,69 +405,52 @@ func processLargeImage(req *CompressionRequest) CompressionResponse {
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	// Copy file data to temp file in chunks
-	written, err := io.CopyBuffer(tmpFile, req.File, make([]byte, ChunkSize))
+	// Use buffer pool
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
+
+	written, err := io.CopyBuffer(tmpFile, req.File, buffer)
 	if err != nil {
 		return CompressionResponse{Err: fmt.Errorf("failed to copy to temp file: %v", err)}
 	}
 
 	log.Printf("Copied %d bytes to temp file", written)
 
-	// Reopen temp file for reading
 	tmpFile.Seek(0, 0)
 
-	// Try to decode with config first to get dimensions without loading full image
 	var config image.Config
-	var decodeErr error
-
 	contentType := req.Header.Header.Get("Content-Type")
 	switch contentType {
 	case "image/png":
-		config, decodeErr = png.DecodeConfig(tmpFile)
+		config, err = png.DecodeConfig(tmpFile)
 	default:
-		config, decodeErr = jpeg.DecodeConfig(tmpFile)
+		config, err = jpeg.DecodeConfig(tmpFile)
 	}
 
-	if decodeErr != nil {
-		return CompressionResponse{Err: fmt.Errorf("failed to decode image config: %v", decodeErr)}
+	if err != nil {
+		return CompressionResponse{Err: fmt.Errorf("failed to decode image config: %v", err)}
 	}
 
 	log.Printf("Image dimensions: %dx%d", config.Width, config.Height)
 
-	// Calculate smart resize ratio for extremely large images
 	targetWidth := req.MaxWidth
-	resizeRatio := 1.0
-
 	if config.Width > req.MaxWidth {
-		resizeRatio = float64(req.MaxWidth) / float64(config.Width)
-		log.Printf("Will resize by ratio: %.3f", resizeRatio)
+		log.Printf("Will resize from %d to %d", config.Width, req.MaxWidth)
 	}
 
-	// Check if image is too large in dimensions even after planned resize
-	estimatedMemory := int64(config.Width * config.Height * 4) // 4 bytes per pixel
-	maxMemoryForLargeFiles := int64(800 * 1024 * 1024)         // 800MB limit for large files
+	// Simple memory check
+	estimatedMemory := int64(config.Width * config.Height * 4)
+	maxMemoryForLargeFiles := int64(500 * 1024 * 1024) // 500MB
 
-	// If still too large, calculate a more aggressive resize
 	if estimatedMemory > maxMemoryForLargeFiles {
-		// Calculate maximum dimensions we can handle
-		maxPixels := maxMemoryForLargeFiles / 4 // 4 bytes per pixel
+		maxPixels := maxMemoryForLargeFiles / 4
 		maxDimension := int(math.Sqrt(float64(maxPixels)))
-
-		if config.Width > maxDimension || config.Height > maxDimension {
-			// Use the smaller of current target or safe dimension
-			if maxDimension < targetWidth {
-				targetWidth = maxDimension
-				resizeRatio = float64(maxDimension) / float64(config.Width)
-				log.Printf("Extremely large image detected, using aggressive resize ratio: %.3f (target width: %d)",
-					resizeRatio, targetWidth)
-			}
-		} else {
-			return CompressionResponse{Err: fmt.Errorf("image dimensions too large: %dx%d (estimated %dMB, max: %dMB)",
-				config.Width, config.Height, estimatedMemory/(1024*1024), maxMemoryForLargeFiles/(1024*1024))}
+		if maxDimension < targetWidth {
+			targetWidth = maxDimension
+			log.Printf("Very large image detected, resizing to %d", targetWidth)
 		}
 	}
 
-	// Reset file pointer and decode the actual image
 	tmpFile.Seek(0, 0)
 
 	var img image.Image
@@ -498,18 +465,17 @@ func processLargeImage(req *CompressionRequest) CompressionResponse {
 		return CompressionResponse{Err: fmt.Errorf("failed to decode large image: %v", err)}
 	}
 
-	// Resize if needed
 	bounds := img.Bounds()
 	currentWidth := bounds.Dx()
 
 	if currentWidth > targetWidth {
 		log.Printf("Resizing large image from %dx%d to target width %d", currentWidth, bounds.Dy(), targetWidth)
-		img = imaging.Resize(img, targetWidth, 0, imaging.Lanczos)
-		runtime.GC() // Force GC after resize
-		log.Printf("Resize completed, new dimensions: %dx%d", img.Bounds().Dx(), img.Bounds().Dy())
+		// Use faster resize algorithm
+		img = imaging.Resize(img, targetWidth, 0, imaging.Box)
+		runtime.GC()
+		log.Printf("Resize completed")
 	}
 
-	// Convert to WebP
 	var buf bytes.Buffer
 	options := &webp.Options{
 		Quality:  float32(req.Quality),
@@ -520,7 +486,6 @@ func processLargeImage(req *CompressionRequest) CompressionResponse {
 		return CompressionResponse{Err: fmt.Errorf("webp encode error for large image: %v", err)}
 	}
 
-	// Clear memory
 	img = nil
 	runtime.GC()
 
@@ -528,57 +493,59 @@ func processLargeImage(req *CompressionRequest) CompressionResponse {
 	return CompressionResponse{WebPData: buf.Bytes()}
 }
 
-func processStandardImage(req *CompressionRequest) CompressionResponse {
-	// Create a limited reader to prevent excessive memory usage
-	limitedReader := &io.LimitedReader{R: req.File, N: MaxFileSize}
+func processStandardImageFast(req *CompressionRequest) CompressionResponse {
+	// Use buffer pool
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
 
-	// Decode image based on content type
+	var buf bytes.Buffer
+	_, err := io.CopyBuffer(&buf, req.File, buffer)
+	if err != nil {
+		return CompressionResponse{Err: fmt.Errorf("read error: %v", err)}
+	}
+
 	var img image.Image
-	var err error
+	reader := bytes.NewReader(buf.Bytes())
 
 	contentType := req.Header.Header.Get("Content-Type")
 	switch contentType {
 	case "image/png":
-		img, err = png.Decode(limitedReader)
-	default: // Default to JPEG
-		img, err = jpeg.Decode(limitedReader)
+		img, err = png.Decode(reader)
+	default:
+		img, err = jpeg.Decode(reader)
 	}
 
 	if err != nil {
 		return CompressionResponse{Err: fmt.Errorf("decode error: %v", err)}
 	}
 
-	// Check image dimensions and memory requirements
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 
-	// Estimate memory usage (4 bytes per pixel for RGBA)
+	// Simple memory check
 	estimatedMemory := width * height * 4
-	if estimatedMemory > 100*1024*1024 { // 100MB limit for standard files
-		return CompressionResponse{Err: fmt.Errorf("image too large: %dx%d pixels (estimated %dMB)",
-			width, height, estimatedMemory/(1024*1024))}
+	if estimatedMemory > 100*1024*1024 { // 100MB limit
+		return CompressionResponse{Err: fmt.Errorf("image too large: %dx%d pixels", width, height)}
 	}
 
-	// Resize if needed
 	if width > req.MaxWidth {
-		img = imaging.Resize(img, req.MaxWidth, 0, imaging.Lanczos)
+		// Use faster resize algorithm
+		img = imaging.Resize(img, req.MaxWidth, 0, imaging.Box)
 		runtime.GC()
 	}
 
-	// Convert to WebP
-	var buf bytes.Buffer
+	var encodeBuf bytes.Buffer
 	options := &webp.Options{
 		Quality:  float32(req.Quality),
 		Lossless: req.Lossless,
 	}
 
-	if err := webp.Encode(&buf, img, options); err != nil {
+	if err := webp.Encode(&encodeBuf, img, options); err != nil {
 		return CompressionResponse{Err: fmt.Errorf("webp encode error: %v", err)}
 	}
 
-	// Clear memory
 	img = nil
 	runtime.GC()
 
-	return CompressionResponse{WebPData: buf.Bytes()}
+	return CompressionResponse{WebPData: encodeBuf.Bytes()}
 }
