@@ -34,14 +34,14 @@ import (
 
 // Optimized settings for speed
 const (
-	MaxUploadSize      = 30 << 20 // 30MB (reduced)
+	MaxUploadSize      = 100 << 20 // 30MB (reduced)
 	DefaultQuality     = 70       // Lower quality for speed
 	MaxWidth           = 1920     // Reduced max width
 	RateLimit          = "150-M"  // Higher rate limit
 	ServerTimeout      = 45 * time.Second
 	Port               = ":8080"
 	MaxConcurrentJobs  = 8          // Increased concurrency
-	MaxFileSize        = 15 << 20   // 15MB per file (reduced)
+	MaxFileSize        = 30 << 20   // 15MB per file (reduced)
 	LargeFileThreshold = 8 << 20    // 8MB threshold
 	ChunkSize          = 512 * 1024 // 512KB chunks
 )
